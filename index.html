@@ -1,0 +1,70 @@
+import argon2 from "argon2";
+import jwt from "jsonwebtoken";
+import crypto from "crypto";
+import { prisma } from "../lib/prisma.js";
+import { env } from "../config/env.js";
+import { sendMail } from "../lib/mailer.js";
+
+export async function register({ email, password, displayName }) {
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) throw Object.assign(new Error("Email already registered"), { status: 409 });
+
+  const hash = await argon2.hash(password);
+  const user = await prisma.user.create({
+    data: {
+      email,
+      passwordHash: hash,
+      displayName,
+      wallet: { create: {} },
+    },
+  });
+
+  const token = crypto.randomBytes(32).toString("hex");
+  await prisma.verificationToken.create({
+    data: { userId: user.id, token, expiresAt: new Date(Date.now() + 24 * 3600 * 1000) },
+  });
+
+  const link = `${env.FRONTEND_URL}/verify?token=${token}`;
+  await sendMail({
+    to: email,
+    subject: "Verify your TradePro account",
+    text: `Verify: ${link}`,
+  });
+
+  return user;
+}
+
+export async function login({ email, password, req }) {
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user) throw Object.assign(new Error("Invalid credentials"), { status: 401 });
+
+  const ok = await argon2.verify(user.passwordHash, password);
+  if (!ok) throw Object.assign(new Error("Invalid credentials"), { status: 401 });
+
+  const token = jwt.sign({ sub: user.id, role: user.role, email: user.email }, env.JWT_SECRET, {
+    expiresIn: env.JWT_EXPIRES_IN,
+  });
+
+  await prisma.session.create({
+    data: {
+      userId: user.id,
+      token,
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+      expiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
+    },
+  });
+
+  await prisma.notification.create({
+    data: { userId: user.id, type: "security", title: "New login", body: `From IP ${req.ip}` },
+  });
+
+  return { token, user };
+}
+
+export async function verifyEmail(token) {
+  const row = await prisma.verificationToken.findUnique({ where: { token } });
+  if (!row || row.used || row.expiresAt < new Date()) throw new Error("Invalid or expired token");
+  await prisma.user.update({ where: { id: row.userId }, data: { emailVerified: true } });
+  await prisma.verificationToken.update({ where: { id: row.id }, data: { used: true } });
+}
